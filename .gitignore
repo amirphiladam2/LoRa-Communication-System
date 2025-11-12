@@ -1,0 +1,36 @@
+# Arduino build files
+*.hex
+*.elf
+*.bin
+build/
+.vscode/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# IDE files
+*.swp
+*.swo
+*~
+.idea/
+
+# Library build artifacts (keep source, ignore build outputs)
+libraries/*/build/
+libraries/*/.vs/
+libraries/*/.vscode/
+
+# Temporary files
+*.tmp
+*.log
+*.bak
+
+# Compiled files
+*.o
+*.a
+
+# PlatformIO (if used)
+.pio/
+.platformio/
+
