@@ -5,11 +5,18 @@
 #include <Adafruit_LIS3DH.h>
 #include <Adafruit_Sensor.h>
 
-//  LoRa Pins (ESP32) 
+// GPS Configuration
+#define GPS_RX_PIN 16
+#define GPS_TX_PIN 17
+HardwareSerial gpsSerial(2); 
+TinyGPSPlus gps;
+
+// LoRa Pins (ESP32)
 #define LORA_SS    5
 #define LORA_RST   -1   
 #define LORA_DIO0 27
-//  Fire Detection 
+
+// Fire Detection 
 #define FLAME_SENSOR_PIN 25
 #define FLAME_SENSOR_ACTIVE_LOW true
 const int FLAME_SAMPLES_NEEDED = 3;
@@ -39,72 +46,40 @@ unsigned long loopCount = 0;
 bool loraReady = false;
 bool accelReady = false;
 
-//Setup Sample Coordinates 
-const float SAMPLE_LAT = 30.768885;
-const float SAMPLE_LNG =  76.57521;
+// Fallback Coordinates (if GPS signal is lost)
+const float FALLBACK_LAT = 30.768885;
+const float FALLBACK_LNG = 76.57521;
 
-//Setup
 void setup() {
   Serial.begin(115200);
+  gpsSerial.begin(9600, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
+  
   delay(500);
-  Serial.println(F("\n=== LoRa Transmitter (Demo Coordinates) ==="));
+  Serial.println(F("\n=== LoRa Transmitter (Live GPS) ==="));
 
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, HIGH);
 
   pinMode(FLAME_SENSOR_PIN, INPUT_PULLUP);
-  Serial.println(F("Flame sensor ready"));
 
   // I2C for accelerometer
   Wire.begin(21, 22);
   Wire.setClock(400000);
 
   // LoRa init
-  Serial.print(F("Init LoRa... "));
-  SPI.end(); 
   SPI.begin(18, 19, 23, LORA_SS); 
   LoRa.setPins(LORA_SS, LORA_RST, LORA_DIO0);
   if (!LoRa.begin(433E6)) {
-    Serial.println(F("FAILED"));
-    while (1) {
-      digitalWrite(LED_PIN, !digitalRead(LED_PIN));
-      delay(100);
-    }
+    Serial.println(F("LoRa FAILED"));
+    while (1) { digitalWrite(LED_PIN, !digitalRead(LED_PIN)); delay(100); }
   }
-  LoRa.setSpreadingFactor(7);
-  LoRa.setSignalBandwidth(125E3);
-  LoRa.setCodingRate4(5);
   LoRa.setSyncWord(0x12);
-  LoRa.enableCrc();
-  LoRa.setTxPower(20);
   loraReady = true;
-  Serial.println(F("OK"));
 
   // Accelerometer init
-  Serial.print(F("Init LIS3DH... "));
   if (lis3dh.begin(0x19) || lis3dh.begin(0x18)) {
     lis3dh.setRange(LIS3DH_RANGE_2_G);
-    lis3dh.setDataRate(LIS3DH_DATARATE_100_HZ);
     accelReady = true;
-    Serial.println(F("OK"));
-  } else {
-    Serial.println(F("SKIPPED"));
-  }
-
-  if (accelReady) {
-    Serial.print(F("Calibrating accel"));
-    for (int i = 0; i < 10; i++) {
-      sensors_event_t event;
-      lis3dh.getEvent(&event);
-      float ax = event.acceleration.x / 9.81;
-      float ay = event.acceleration.y / 9.81;
-      float az = (event.acceleration.z / 9.81) - 1.0;
-      float rawAccel = sqrt(ax * ax + ay * ay + az * az);
-      filteredAccel = (0.5 * rawAccel) + (0.5 * filteredAccel);
-      Serial.print(F("."));
-      delay(50);
-    }
-    Serial.println(F(" done"));
   }
 
   digitalWrite(LED_PIN, LOW);
@@ -116,13 +91,29 @@ void blinkLED() {
   ledTurnOffTime = millis() + LED_BLINK_MS;
 }
 
-void sendLoRaAlert(const char* type, float lat, float lng, float extra) {
+// Function to feed GPS during delays
+static void smartDelay(unsigned long ms) {
+  unsigned long start = millis();
+  do {
+    while (gpsSerial.available())
+      gps.encode(gpsSerial.read());
+  } while (millis() - start < ms);
+}
+
+void sendLoRaAlert(const char* type, float extra) {
   if (!loraReady) return;
-  char payload[64];
-  snprintf(payload, sizeof(payload), "%s,%.6f,%.6f,%.2f", type, lat, lng, extra);
+
+  float currentLat = (gps.location.isValid()) ? gps.location.lat() : FALLBACK_LAT;
+  float currentLng = (gps.location.isValid()) ? gps.location.lng() : FALLBACK_LNG;
+
+  char payload[80];
+  snprintf(payload, sizeof(payload), "%s,%.6f,%.6f,%.2f,Sats:%u", 
+           type, currentLat, currentLng, extra, (unsigned int)gps.satellites.value());
+  
   LoRa.beginPacket();
   LoRa.print(payload);
   LoRa.endPacket();
+  
   Serial.print(F("📡 SENT: "));
   Serial.println(payload);
   blinkLED();
@@ -132,24 +123,28 @@ void loop() {
   unsigned long now = millis();
   loopCount++;
 
+  // Feed GPS
+  while (gpsSerial.available()) {
+    gps.encode(gpsSerial.read());
+  }
+
   if (now >= ledTurnOffTime && digitalRead(LED_PIN) == HIGH) {
     digitalWrite(LED_PIN, LOW);
   }
 
-  //FIRE DETECTION 
+  // FIRE DETECTION
   static int fireCount = 0;
   bool flameDetected = (digitalRead(FLAME_SENSOR_PIN) == (FLAME_SENSOR_ACTIVE_LOW ? LOW : HIGH));
   if (flameDetected) fireCount++;
   else if (fireCount > 0) fireCount--;
 
   if (fireCount >= FLAME_SAMPLES_NEEDED && (now - lastFireAlert > FIRE_MIN_INTERVAL)) {
-    
-    sendLoRaAlert("FIRE", SAMPLE_LAT, SAMPLE_LNG, 1.0);
+    sendLoRaAlert("FIRE", 1.0);
     lastFireAlert = now;
     fireCount = 0;
   }
 
-  //  EARTHQUAKE DETECTION 
+  // EARTHQUAKE DETECTION
   if (accelReady) {
     sensors_event_t event;
     lis3dh.getEvent(&event);
@@ -160,34 +155,31 @@ void loop() {
     filteredAccel = (ALPHA * rawAccel) + ((1 - ALPHA) * filteredAccel);
     quakeWindow[windowIndex] = (filteredAccel > QUAKE_THRESHOLD) ? 1 : 0;
     windowIndex = (windowIndex + 1) % WINDOW_SIZE;
+    
     int shakeCount = 0;
     for (int i = 0; i < WINDOW_SIZE; i++) shakeCount += quakeWindow[i];
 
     if (shakeCount >= 4 && (now - lastQuakeAlert > 5000)) {
-      sendLoRaAlert("QUAKE", SAMPLE_LAT, SAMPLE_LNG, filteredAccel);
+      sendLoRaAlert("QUAKE", filteredAccel);
       lastQuakeAlert = now;
     }
   }
 
-  // STATUS PRINT 
+  // STATUS PRINT
   if (now - lastStatusPrint >= 1000) {
-    unsigned long loopsPerSec = loopCount;
-    loopCount = 0;
-    Serial.print(F("GPS:sent | Flame:"));
-    Serial.print(fireCount);
-    Serial.print(F("/"));
-    Serial.print(FLAME_SAMPLES_NEEDED);
-    Serial.print(F(" | LORA:"));
-    Serial.print(loraReady ? F("OK") : F("NO"));
-    if (accelReady) {
-      Serial.print(F(" | Accel:"));
-      Serial.print(filteredAccel, 3);
+    Serial.print(F("GPS:"));
+    if (gps.location.isValid()) {
+        Serial.print(gps.satellites.value());
+        Serial.print(F(" sats"));
+    } else {
+        Serial.print(F("WAITING"));
     }
-    Serial.print(F(" | Loop:"));
-    Serial.print(loopsPerSec);
-    Serial.println(F("Hz"));
+    Serial.print(F(" | Flame:")); Serial.print(fireCount);
+    if (accelReady) { Serial.print(F(" | Accel:")); Serial.print(filteredAccel, 3); }
+    Serial.println();
     lastStatusPrint = now;
+    loopCount = 0;
   }
 
-  delay(10); // 100 Hz loop
+  smartDelay(10); 
 }
