@@ -10,6 +10,8 @@ The system consists of three distinct nodes:
     - **Auto-Switching**: If the distance is < 50m, it forwards the alert via **ESP-NOW** for lower latency and lower power.
     - **LoRa Fallback**: If the distance > 50m, it forwards the alert via **LoRa** for maximum range.
 3.  **Receiver (ESP8266)**: A hybrid receiver that listens for alerts from both LoRa and ESP-NOW, displaying them on an OLED with audible buzzer warnings.
+       <img width="1674" height="1483" alt="LoRa System" src="https://github.com/user-attachments/assets/e78ce06b-15cd-4117-9f24-2c52b146ffe2" />
+
 
 ##  Key Features
 
