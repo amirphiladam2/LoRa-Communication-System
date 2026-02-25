@@ -3,34 +3,38 @@
 #include <LoRa.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SH110X.h>
+#include <ESP8266WiFi.h>
+#include <espnow.h>
 
-//OLED 
+// OLED Configuration
 Adafruit_SH1106G display(128, 64, &Wire, -1);
 bool displayReady = false;
 
-//LoRa Pins 
+// LoRa Pins
 #define LORA_CS   15
 #define LORA_RST  -1
 #define LORA_DIO0 16
 
-// Buzzer 
-#define BUZZER_PIN 2  // GPIO2 (D4 on NodeMCU)
+// Buzzer Pin
+#define BUZZER_PIN 2 
 
-//LoRa Parameters 
+// LoRa Parameters
 const float LORA_FREQ = 433E6;
-const uint8_t LORA_SF = 7;
-const long LORA_BW = 125E3;
-const uint8_t LORA_CR = 5;
 const uint8_t LORA_SYNC = 0x12;
 
-//Timing 
+// Timing
 const unsigned long DISPLAY_TIMEOUT = 15000UL;
 
-//States 
+// ESP-NOW Data Structure
+struct __attribute__((packed)) EspNowMessage {
+  char msg[64];
+};
+
+// System States
 unsigned long lastAlertTime = 0;
 bool alertDisplayed = false;
 
-//Buzzer Control 
+// Buzzer Control
 struct {
   bool active;
   bool isHigh;
@@ -39,19 +43,31 @@ struct {
   unsigned long nextToggle;
 } buzzer = {false, false, 0, 0, 0};
 
-//Alert Types 
+// Alert Types
 enum AlertType { NONE = 0, FIRE = 1, QUAKE = 2 };
 
-//Function Prototypes
+// Function Prototypes
 void showListeningScreen();
 void displayAlert(AlertType type, float lat, float lng, float extra);
 void parseMessage(const char* msg, AlertType* type, float* lat, float* lng, float* extra);
 void startBuzzer(AlertType type);
 void updateBuzzer();
+void onDataRecv(uint8_t * mac, uint8_t *incomingData, uint8_t len);
 
 void setup() {
   Serial.begin(115200);
-  Serial.println(F("\n=== ESP8266 LoRa Alert Receiver (SH1106) ==="));
+  Serial.println(F("\n=== ESP8266 Hybrid Receiver (SH1106) ==="));
+
+  // Initialize WiFi for ESP-NOW
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  if (esp_now_init() != 0) {
+    Serial.println(F("ESP-NOW Init Failed"));
+  } else {
+    esp_now_set_self_role(ESP_NOW_ROLE_SLAVE);
+    esp_now_register_recv_cb(onDataRecv);
+    Serial.println(F("ESP-NOW Ready"));
+  }
 
   // OLED Init
   Wire.begin(4, 5);  
@@ -67,7 +83,7 @@ void setup() {
     Serial.println(F("OK"));
     showListeningScreen();
   } else {
-    Serial.println(F("OLED not detected! Check wiring."));
+    Serial.println(F("OLED not detected!"));
   }
 
   // Buzzer setup
@@ -78,16 +94,12 @@ void setup() {
   Serial.print(F("Initializing LoRa... "));
   LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
   if (!LoRa.begin(LORA_FREQ)) {
-    Serial.println(F("FAILED (Check wiring and power)"));
+    Serial.println(F("FAILED"));
     while (true) delay(1000);
   }
-  LoRa.setSpreadingFactor(LORA_SF);
-  LoRa.setSignalBandwidth(LORA_BW);
-  LoRa.setCodingRate4(LORA_CR);
   LoRa.setSyncWord(LORA_SYNC);
   LoRa.enableCrc();
   Serial.println(F("LoRa Ready (433 MHz)"));
-  Serial.println(F("Listening for alerts..."));
 }
 
 void showListeningScreen() {
@@ -96,8 +108,33 @@ void showListeningScreen() {
   display.setTextSize(1);
   display.setCursor(0, 0);
   display.println(F("Receiver Ready"));
-  display.println(F("Listening..."));
+  display.println(F("Hybrid Active:"));
+  display.println(F("- ESP-NOW Mesh"));
+  display.println(F("- LoRa Long Range"));
   display.display();
+}
+
+void onDataRecv(uint8_t * mac, uint8_t *incomingData, uint8_t len) {
+  EspNowMessage espMsg;
+  memcpy(&espMsg, incomingData, sizeof(espMsg));
+  
+  Serial.print(F("📡 ESP-NOW Recv: "));
+  Serial.println(espMsg.msg);
+  
+  processIncomingAlert(espMsg.msg);
+}
+
+void processIncomingAlert(const char* msg) {
+  AlertType type;
+  float lat, lng, extra;
+  parseMessage(msg, &type, &lat, &lng, &extra);
+  
+  if (type != NONE) {
+    displayAlert(type, lat, lng, extra);
+    startBuzzer(type);
+    lastAlertTime = millis();
+    alertDisplayed = true;
+  }
 }
 
 void displayAlert(AlertType type, float lat, float lng, float extra) {
@@ -108,9 +145,9 @@ void displayAlert(AlertType type, float lat, float lng, float extra) {
   display.setCursor(0, 0);
 
   if (type == FIRE) {
-    display.println(F("FIRE ALERT!"));
+    display.println(F("*** FIRE ALERT ***"));
   } else if (type == QUAKE) {
-    display.println(F("EARTHQUAKE!"));
+    display.println(F("*** EARTHQUAKE ***"));
   }
 
   display.println();
@@ -194,18 +231,11 @@ void loop() {
     }
     msg[idx] = '\0';
 
-    AlertType type;
-    float lat, lng, extra;
-    parseMessage(msg, &type, &lat, &lng, &extra);
-    if (type != NONE) {
-      Serial.print(F("📡 Received: "));
-      Serial.println(msg);
-      displayAlert(type, lat, lng, extra);
-      startBuzzer(type);
-      lastAlertTime = millis();
-      alertDisplayed = true;
-    }
+    Serial.print(F("📡 LoRa Recv: "));
+    Serial.println(msg);
+    processIncomingAlert(msg);
   }
 
-  yield(); // keep watchdog happy
+  yield();
 }
+

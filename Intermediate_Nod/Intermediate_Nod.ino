@@ -9,11 +9,13 @@
 
 #include <SPI.h>
 #include <LoRa.h>
+#include <ESP8266WiFi.h>
+#include <espnow.h>
 
 // ===== LoRa Pins (ESP8266) =====
-#define LORA_CS   15   // D8
-#define LORA_RST  -1   // Tied to 3.3V externally
-#define LORA_DIO0 4   // D0 (GPIO16) - Also onboard LED
+#define LORA_CS   15   
+#define LORA_RST  -1   
+#define LORA_DIO0 4   
 
 // ===== LED Indicators =====
 #define RX_LED_PIN 2       // D4 (GPIO2) - External LED for reception
@@ -33,9 +35,21 @@ int cacheIndex = 0;
 
 const unsigned long DEDUPE_WINDOW = 5000;  // 5 seconds
 
+// ===== ESP-NOW Configuration =====
+uint8_t receiverAddress[] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF}; // Broadcast address
+struct __attribute__((packed)) EspNowMessage {
+  char msg[64];
+};
+
+// ===== Distance Threshold =====
+const float DISTANCE_THRESHOLD_METERS = 50.0;
+const float RECEIVER_LAT = 30.768885; // Default Receiver Lat
+const float RECEIVER_LNG = 76.57521;  // Default Receiver Lng
+
 // ===== Statistics =====
 unsigned long messagesReceived = 0;
-unsigned long messagesForwarded = 0;
+unsigned long messagesForwardedLoRa = 0;
+unsigned long messagesForwardedEspNow = 0;
 unsigned long messagesDuplicate = 0;
 unsigned long lastStatsDisplay = 0;
 
@@ -50,7 +64,7 @@ void setup() {
   digitalWrite(RX_LED_PIN, LOW);
   digitalWrite(TX_LED_PIN, LOW);
   
-  Serial.println(F("✅ LEDs initialized"));
+  Serial.println(F("LEDs initialized"));
   Serial.print(F("   RX LED: D4 (GPIO"));
   Serial.print(RX_LED_PIN);
   Serial.println(F(")"));
@@ -59,7 +73,7 @@ void setup() {
   Serial.println(F(")"));
 
   // Startup LED test
-  Serial.println(F("\n🔆 LED Test..."));
+  Serial.println(F("\nLED Test..."));
   for (int i = 0; i < 3; i++) {
     digitalWrite(RX_LED_PIN, HIGH);
     delay(150);
@@ -74,22 +88,24 @@ void setup() {
     delay(150);
   }
 
-  // Initialize I2C for LoRa (ESP8266 standard pins)
-  SPI.begin();
+  // Initialize WiFi for ESP-NOW
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+
+  if (esp_now_init() != 0) {
+    Serial.println(F("ESP-NOW Init Failed"));
+  } else {
+    esp_now_set_self_role(ESP_NOW_ROLE_COMBO);
+    esp_now_add_peer(receiverAddress, ESP_NOW_ROLE_COMBO, 1, NULL, 0);
+    Serial.println(F("ESP-NOW Initialized"));
+  }
 
   // Initialize LoRa
   Serial.print(F("Initializing LoRa... "));
   LoRa.setPins(LORA_CS, LORA_RST, LORA_DIO0);
   
   if (!LoRa.begin(433E6)) {
-    Serial.println(F("❌ FAILED!"));
-    Serial.println(F("Check connections:"));
-    Serial.println(F("  SCK  -> D5 (GPIO14)"));
-    Serial.println(F("  MISO -> D6 (GPIO12)"));
-    Serial.println(F("  MOSI -> D7 (GPIO13)"));
-    Serial.println(F("  CS   -> D8 (GPIO15)"));
-    Serial.println(F("  DIO0 -> D0 (GPIO16)"));
-    
+    Serial.println(F("FAILED!"));
     while (1) {
       digitalWrite(RX_LED_PIN, !digitalRead(RX_LED_PIN));
       digitalWrite(TX_LED_PIN, !digitalRead(TX_LED_PIN));
@@ -97,16 +113,12 @@ void setup() {
     }
   }
   
-  // Match transmitter/receiver settings
-  LoRa.setSpreadingFactor(7);
-  LoRa.setSignalBandwidth(125E3);
-  LoRa.setCodingRate4(5);
   LoRa.setSyncWord(0x12);
   LoRa.enableCrc();
-  LoRa.setTxPower(20);  // Max power for relay
+  LoRa.setTxPower(20);
   
-  Serial.println(F("✅ OK (433MHz, SF7)"));
-  Serial.println(F("\n✅ Relay Active - Listening...\n"));
+  Serial.println(F("OK (433MHz)"));
+  Serial.println(F("\nRelay Active - Listening...\n"));
   
   // Initialize message cache
   for (int i = 0; i < CACHE_SIZE; i++) {
@@ -158,23 +170,61 @@ bool isValidMessage(const char* msg) {
   return false;
 }
 
+float calculateDistance(float lat1, float lon1, float lat2, float lon2) {
+  const float R = 6371000; // Earth radius in meters
+  float phi1 = lat1 * PI / 180;
+  float phi2 = lat2 * PI / 180;
+  float deltaPhi = (lat2 - lat1) * PI / 180;
+  float deltaLambda = (lon2 - lon1) * PI / 180;
+
+  float a = sin(deltaPhi / 2) * sin(deltaPhi / 2) +
+            cos(phi1) * cos(phi2) *
+            sin(deltaLambda / 2) * sin(deltaLambda / 2);
+  float c = 2 * atan2(sqrt(a), sqrt(1 - a));
+
+  return R * c;
+}
+
 void forwardMessage(const char* msg) {
-  // Add small random delay to avoid collision with original transmitter
-  delay(random(50, 150));
-  
-  // Transmit
-  LoRa.beginPacket();
-  LoRa.print(msg);
-  bool success = LoRa.endPacket();
-  
-  if (success) {
-    blinkTxLed();
-    messagesForwarded++;
+  // Parse coordinates from message to calculate distance
+  float transLat = 0, transLng = 0;
+  const char* p = strchr(msg, ',');
+  if (p) {
+    transLat = atof(++p);
+    p = strchr(p, ',');
+    if (p) transLng = atof(++p);
+  }
+
+  float dist = calculateDistance(transLat, transLng, RECEIVER_LAT, RECEIVER_LNG);
+  Serial.print(F("Distance to Receiver: "));
+  Serial.print(dist);
+  Serial.println(F(" meters"));
+
+  if (dist < DISTANCE_THRESHOLD_METERS) {
+    // Forward via ESP-NOW (Short Range)
+    EspNowMessage espMsg;
+    strncpy(espMsg.msg, msg, sizeof(espMsg.msg) - 1);
+    espMsg.msg[sizeof(espMsg.msg) - 1] = '\0';
     
-    Serial.print(F("📤 FORWARDED: "));
-    Serial.println(msg);
+    int result = esp_now_send(receiverAddress, (uint8_t *)&espMsg, sizeof(espMsg));
+    if (result == 0) {
+      Serial.println(F("FORWARDED (ESP-NOW)"));
+      messagesForwardedEspNow++;
+      blinkTxLed();
+    } else {
+      Serial.println(F("ESP-NOW Forward failed"));
+    }
   } else {
-    Serial.println(F("⚠️ Forward failed"));
+    // Forward via LoRa (Long Range)
+    LoRa.beginPacket();
+    LoRa.print(msg);
+    if (LoRa.endPacket()) {
+      Serial.println(F("FORWARDED (LoRa)"));
+      messagesForwardedLoRa++;
+      blinkTxLed();
+    } else {
+      Serial.println(F("LoRa Forward failed"));
+    }
   }
 }
 
@@ -218,14 +268,14 @@ void loop() {
     
     // Validate message format
     if (!isValidMessage(msg)) {
-      Serial.println(F("   ⚠️ Invalid format - not forwarding"));
+      Serial.println(F("Invalid format - not forwarding"));
       return;
     }
     
     // Check for duplicates
     if (isDuplicate(msg)) {
       messagesDuplicate++;
-      Serial.println(F("   🔁 Duplicate - not forwarding"));
+      Serial.println(F("Duplicate - not forwarding"));
       return;
     }
     
@@ -239,13 +289,15 @@ void loop() {
   // ===== Display statistics every 10 seconds =====
   if (now - lastStatsDisplay >= 10000) {
     Serial.println(F("\n--- Statistics ---"));
-    Serial.print(F("Received:   "));
+    Serial.print(F("Received:      "));
     Serial.println(messagesReceived);
-    Serial.print(F("Forwarded:  "));
-    Serial.println(messagesForwarded);
-    Serial.print(F("Duplicates: "));
+    Serial.print(F("Forwarded LoRa:  "));
+    Serial.println(messagesForwardedLoRa);
+    Serial.print(F("Forwarded E-NOW: "));
+    Serial.println(messagesForwardedEspNow);
+    Serial.print(F("Duplicates:    "));
     Serial.println(messagesDuplicate);
-    Serial.print(F("Uptime:     "));
+    Serial.print(F("Uptime:        "));
     Serial.print(now / 1000);
     Serial.println(F(" seconds\n"));
     
